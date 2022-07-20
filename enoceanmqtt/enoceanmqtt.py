@@ -11,6 +11,7 @@ import argparse
 from configparser import ConfigParser
 
 from enoceanmqtt.communicator import Communicator
+from enoceanmqtt.overlays.homeassistant.ha_communicator import HACommunicator
 
 conf = {
     'debug': False,
@@ -110,8 +111,15 @@ def main():
     sensors, global_config = load_config_file(conf['config'])
     conf.update(global_config)
 
+    # Select the overlay
+    if str(global_config.get('overlay')).lower() == "ha":
+        logging.info("Selected overlay : Home Assistant")
+        com = HACommunicator(conf, sensors)
+    else:
+        logging.info("Selected overlay : None")
+        com = Communicator(conf, sensors)
+
     # start working
-    com = Communicator(conf, sensors)
     try:
         com.run()
 
