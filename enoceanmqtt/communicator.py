@@ -142,8 +142,11 @@ class Communicator:
                     # Clear sent data, if requested by the send message
                     # MQTT payload is binary data, thus we need to decode it
                     clear = False
-                    if msg.payload.decode('UTF-8') == "clear":
-                        clear = True
+                    for action in msg.payload.decode('UTF-8').lower().split('+'):
+                        if action == "clear":
+                            clear = True
+                        elif action == "learn":
+                            cur_sensor['learn'] = True
 
                     self._send_message(cur_sensor, clear)
 
@@ -181,9 +184,13 @@ class Communicator:
                     # do we face a send request?
                     if "send" in mqtt_json_payload.keys():
                         send = True
-                        # Check whether the data buffer shall be cleared
-                        if mqtt_json_payload['send'] == "clear":
-                            clear = True
+                        # Decode packet handling actions
+                        for action in mqtt_json_payload['send'].lower().split('+'):
+                            # Check whether the data buffer shall be cleared
+                            if action == "clear":
+                                clear = True
+                            elif action == "learn":
+                                cur_sensor['learn'] = True
 
                         # Remove 'send' field as it is not part of EnOcean data
                         del mqtt_json_payload['send']
@@ -226,12 +233,8 @@ class Communicator:
         command_shortcut = sensor.get('command')
 
         if command_shortcut:
-            # Check MQTT message has valid data
-            if 'data' not in sensor:
-                logging.warning('No data to send from MQTT message!')
-                return
             # Check MQTT message sets the command field
-            if command_shortcut not in sensor['data'] or sensor['data'][command_shortcut] is None:
+            if not sensor.get('data') or not sensor.get('data').get(command_shortcut):
                 logging.warning(
                     'Command field %s must be set in MQTT message!', command_shortcut)
                 return
@@ -239,12 +242,17 @@ class Communicator:
             command = sensor['data'][command_shortcut]
             logging.debug('Retrieved command id from MQTT message: %s', hex(command))
 
+        # Send the MQTT message
         self._send_packet(sensor, destination, command)
 
         # Clear sent data, if requested by the sent message
         if clear == True:
             logging.debug('Clearing data buffer.')
             del sensor['data']
+
+        # Delete learn
+        if 'learn' in sensor:
+            del sensor['learn']
 
 
     #=============================================================================================
@@ -425,7 +433,7 @@ class Communicator:
         else:
             direction = None
         # is this a response to a learn packet?
-        is_learn = learn_data is not None
+        is_learn_response = learn_data is not None
 
         # Add possibility for the user to indicate a specific sender address
         # in sensor configuration using added 'sender' field.
@@ -434,18 +442,23 @@ class Communicator:
             sender = [(sensor['sender'] >> i*8) & 0xff for i in reversed(range(4))]
         else:
             sender = self.enocean_sender
+        
+        # Check whether the learn bit should be set in the packet (only valid for RORG.BS1 and RORG.BS4)
+        force_learn = False
+        if sensor.get('learn'):
+            force_learn = True
 
         try:
             # Now pass command to RadioPacket.create()
             packet = RadioPacket.create(sensor['rorg'], sensor['func'], sensor['type'],
                                         direction=direction, command=command, sender=sender,
-                                        destination=destination, learn=is_learn)
+                                        destination=destination, learn=is_learn_response|force_learn)
         except ValueError as err:
             logging.error("Cannot create RF packet: %s", err)
             return
 
         # assemble data based on packet type (learn / data)
-        if not is_learn:
+        if not is_learn_response:
             # data packet received
             # start with default data
 
