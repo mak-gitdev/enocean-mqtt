@@ -451,8 +451,21 @@ class Communicator:
 
             # Initialize packet with default_data if specified
             if 'default_data' in sensor:
-                packet.data[1:5] = [(sensor['default_data'] >> i*8) &
-                                    0xff for i in reversed(range(4))]
+                # Check default_data type
+                try:
+                    # Default data is raw data
+                    default_data = int(sensor['default_data'], 0)
+                    packet.data[1:5] = [(default_data >> i*8) &
+                                        0xff for i in reversed(range(4))]
+                except:
+                    # Default data is property-based
+                    logging.debug("sensor default_data: %s", sensor['default_data'])
+                    # Set packet data payload
+                    packet.set_eep(json.loads(sensor['default_data']))
+                    # Set packet status bits
+                    packet.data[-1] = packet.status
+                    # Ensure that the logging output of packet is updated
+                    packet.parse_eep()
 
             # do we have specific data to send?
             if 'data' in sensor:
