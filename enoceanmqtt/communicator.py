@@ -142,14 +142,24 @@ class Communicator:
                     # Clear sent data, if requested by the send message
                     # MQTT payload is binary data, thus we need to decode it
                     clear = False
+                    raw_data = False
                     for action in msg.payload.decode('UTF-8').lower().split('+'):
                         if action == "clear":
                             clear = True
                         elif action == "learn":
                             cur_sensor['learn'] = True
+                        elif action == "raw_data":
+                            raw_data = True
+
+                    # raw_data has not been validated by the send payload
+                    if 'raw_data' in cur_sensor and not raw_data:
+                        del cur_sensor['raw_data']
 
                     self._send_message(cur_sensor, clear)
 
+                elif prop == "raw_data":
+                    found_topic = True
+                    cur_sensor['raw_data'] = msg.payload.decode('UTF-8')
                 else:
                     found_topic = True
                     # parse message content
@@ -191,6 +201,10 @@ class Communicator:
                                 clear = True
                             elif action == "learn":
                                 cur_sensor['learn'] = True
+                            elif action == "raw_data":
+                                if 'raw_data' in mqtt_json_payload:
+                                    cur_sensor['raw_data'] = mqtt_json_payload['raw_data']
+                                    del mqtt_json_payload['raw_data']
 
                         # Remove 'send' field as it is not part of EnOcean data
                         del mqtt_json_payload['send']
@@ -254,6 +268,9 @@ class Communicator:
         if 'learn' in sensor:
             del sensor['learn']
 
+        # Delete raw_data if any
+        if 'raw_data' in sensor:
+            del sensor['raw_data']
 
     #=============================================================================================
     # ENOCEAN TO MQTT
@@ -380,6 +397,11 @@ class Communicator:
         # Retrieve properties from EEP
         properties = packet.parse_eep(sensor['func'], sensor['type'], direction, command)
 
+        # Now send also raw data to MQTT
+        raw_data = packet.data[1:len(packet.data)-1-4]
+        raw_data.append(packet.data[-1])
+        mqtt_json["_RAW_DATA_"] = enocean.utils.to_hex_string(raw_data)
+
         # loop through all EEP properties
         for prop_name in properties:
             found_property = True
@@ -441,8 +463,11 @@ class Communicator:
         try:
             # Now pass command to RadioPacket.create()
             packet = RadioPacket.create(sensor['rorg'], sensor['func'], sensor['type'],
-                                        direction=direction, command=command, sender=sender,
-                                        destination=destination, learn=is_learn_response|force_learn)
+                                        direction=direction,
+                                        command=command,
+                                        sender=sender,
+                                        destination=destination,
+                                        learn=is_learn_response|force_learn)
         except ValueError as err:
             logging.error("Cannot create RF packet: %s", err)
             return
@@ -450,38 +475,61 @@ class Communicator:
         # assemble data based on packet type (learn / data)
         if not is_learn_response:
             # data packet received
-            # start with default data
-
-            # Initialize packet with default_data if specified
-            if 'default_data' in sensor:
-                # Check default_data type
+            # Check whether payload is raw data
+            if 'raw_data' in sensor:
+                logging.debug("sensor data: %s", sensor['raw_data'])
                 try:
-                    # Default data is raw data
-                    default_data = int(sensor['default_data'], 0)
-                    packet.data[1:5] = [(default_data >> i*8) &
+                    # Use the EnOcean library hex_string format for raw_data
+                    # as there can be more than 8 bytes depending on EEP (VLD)
+                    raw_data = enocean.utils.from_hex_string(sensor['raw_data'])
+                    # Maximum raw data length including status byte
+                    # -1 for RORG, -4 for sender ID
+                    max_raw_data_len = len(packet.data)-1-4
+                    # Status byte should not be set
+                    if len(raw_data) == max_raw_data_len-1:
+                        packet.data[1:max_raw_data_len] = raw_data
+                    # Status byte should be set
+                    elif len(raw_data) == max_raw_data_len:
+                        packet.data[1:max_raw_data_len] = raw_data[:-1]
+                        packet.data[-1] = raw_data[-1]
+                    # Invalid raw data as all data bytes should be set
+                    else:
+                        raise Exception('Invalid raw data length. Should be in range [{}:{}]'.
+                                        format(max_raw_data_len-1,max_raw_data_len))
+                except Exception as ex:
+                    logging.debug("Invalid raw data: %s (%s)", sensor['raw_data'], ex)
+                    return
+            else:
+                # Initialize packet with default_data if specified
+                if 'default_data' in sensor:
+                    # Check default_data type
+                    try:
+                        # Default data is raw data
+                        default_data = int(sensor['default_data'], 0)
+                        packet.data[1:5] = [(default_data >> i*8) &
                                         0xff for i in reversed(range(4))]
-                except:
-                    # Default data is property-based
-                    logging.debug("sensor default_data: %s", sensor['default_data'])
-                    # Set packet data payload
-                    packet.set_eep(json.loads(sensor['default_data']))
+                    except:
+                        # Default data is property-based
+                        logging.debug("sensor default_data: %s", sensor['default_data'])
+                        # Set packet data payload
+                        packet.set_eep(json.loads(sensor['default_data']))
+                        # Set packet status bits
+                        packet.data[-1] = packet.status
+                        # Ensure that the logging output of packet is updated
+                        packet.parse_eep()
+
+                # do we have specific data to send?
+                if 'data' in sensor:
+                    # override with specific data settings
+                    logging.debug("sensor data: %s", sensor['data'])
+                    # Set packet data payload with property-based data
+                    packet.set_eep(sensor['data'])
                     # Set packet status bits
                     packet.data[-1] = packet.status
-                    # Ensure that the logging output of packet is updated
-                    packet.parse_eep()
-
-            # do we have specific data to send?
-            if 'data' in sensor:
-                # override with specific data settings
-                logging.debug("sensor data: %s", sensor['data'])
-                # Set packet data payload
-                packet.set_eep(sensor['data'])
-                # Set packet status bits
-                packet.data[-1] = packet.status
-                packet.parse_eep()  # ensure that the logging output of packet is updated
-            else:
-                # what to do if we have no data to send yet?
-                logging.warning('sending only default data as answer to %s', sensor['name'])
+                    packet.parse_eep()  # ensure that the logging output of packet is updated
+                else:
+                    # what to do if we have no data to send yet?
+                    logging.warning('sending only default data as answer to %s', sensor['name'])
 
         else:
             # learn request received
