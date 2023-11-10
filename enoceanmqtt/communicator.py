@@ -339,73 +339,63 @@ class Communicator:
             for prop_name, value in mqtt_json.items():
                 self.mqtt.publish(f"{topic}/{prop_name}", value, retain=retain)
 
-    def _read_packet(self, packet):
+    def _read_packet(self, packet, sensor):
         '''interpret packet, read properties and publish to MQTT'''
         mqtt_json = {}
-        # loop through all configured devices
-        for cur_sensor in self.sensors:
-            # does this sensor match?
-            if enocean.utils.combine_hex(packet.sender) == cur_sensor['address']:
-                # found sensor configured in config file
 
-                # Shall the packet be published to MQTT ?
-                if not packet.learn or str(cur_sensor.get('log_learn')) in ("True", "true", "1"):
-                    # Store RSSI
-                    # Use underscore so that it is unique and doesn't
-                    # match a potential future EnOcean EEP field.
-                    mqtt_json['_RSSI_'] = packet.dBm
+        # Shall the packet be published to MQTT ?
+        if not packet.learn or str(sensor.get('log_learn')) in ("True", "true", "1"):
+            # Store RSSI
+            # Use underscore so that it is unique and doesn't
+            # match a potential future EnOcean EEP field.
+            mqtt_json['_RSSI_'] = packet.dBm
 
-                    # Store receive date
-                    # Use underscore so that it is unique and doesn't
-                    # match a potential future EnOcean EEP field.
-                    mqtt_json['_DATE_'] = packet.received.isoformat()
+            # Store receive date
+            # Use underscore so that it is unique and doesn't
+            # match a potential future EnOcean EEP field.
+            mqtt_json['_DATE_'] = packet.received.isoformat()
 
-                    # Handling received data packet
-                    found_property = self._handle_data_packet( packet, cur_sensor, mqtt_json)
-                    if not found_property:
-                        logging.warning("message not interpretable: %s", cur_sensor['name'])
-                    else:
-                        self._publish_mqtt(cur_sensor, mqtt_json)
-                else:
-                    # learn request received
-                    logging.info("learn request not emitted to mqtt")
-
-                # The packet has been handled
-                break
+            # Handling received data packet
+            found_property = self._handle_data_packet(packet, sensor, mqtt_json)
+            if not found_property:
+                logging.warning("message not interpretable: %s", sensor['name'])
+            else:
+                self._publish_mqtt(sensor, mqtt_json)
+        else:
+            # learn request received
+            logging.info("learn request not emitted to mqtt")
 
     def _handle_data_packet(self, packet, sensor, mqtt_json):
-        # data packet received
+        # radio packet of proper rorg type received; parse EEP
         found_property = False
-        if packet.packet_type == PACKET.RADIO and packet.rorg == sensor['rorg']:
-            # radio packet of proper rorg type received; parse EEP
-            direction = sensor.get('direction')
+        direction = sensor.get('direction')
 
-            # Retrieve command from the received packet and pass it to parse_eep()
-            command = None
-            if sensor.get('command'):
-                command = self._get_command_id(packet, sensor)
-                if command:
-                    logging.debug('Retrieved command id from packet: %s', hex(command))
+        # Retrieve command from the received packet and pass it to parse_eep()
+        command = None
+        if sensor.get('command'):
+            command = self._get_command_id(packet, sensor)
+            if command:
+                logging.debug('Retrieved command id from packet: %s', hex(command))
 
-            # Retrieve properties from EEP
-            properties = packet.parse_eep(sensor['func'], sensor['type'], direction, command)
+        # Retrieve properties from EEP
+        properties = packet.parse_eep(sensor['func'], sensor['type'], direction, command)
 
-            # loop through all EEP properties
-            for prop_name in properties:
-                found_property = True
-                cur_prop = packet.parsed[prop_name]
-                # we only extract numeric values, either the scaled ones
-                # or the raw values for enums
-                if isinstance(cur_prop['value'], numbers.Number):
-                    value = cur_prop['value']
-                else:
-                    value = cur_prop['raw_value']
-                # publish extracted information
-                logging.debug("%s: %s (%s)=%s %s", sensor['name'], prop_name,
-                              cur_prop['description'], cur_prop['value'], cur_prop['unit'])
+        # loop through all EEP properties
+        for prop_name in properties:
+            found_property = True
+            cur_prop = packet.parsed[prop_name]
+            # we only extract numeric values, either the scaled ones
+            # or the raw values for enums
+            if isinstance(cur_prop['value'], numbers.Number):
+                value = cur_prop['value']
+            else:
+                value = cur_prop['raw_value']
+            # publish extracted information
+            logging.debug("%s: %s (%s)=%s %s", sensor['name'], prop_name,
+                            cur_prop['description'], cur_prop['value'], cur_prop['unit'])
 
-                # Store property
-                mqtt_json[prop_name] = value
+            # Store property
+            mqtt_json[prop_name] = value
 
         return found_property
 
@@ -442,7 +432,7 @@ class Communicator:
             sender = [(sensor['sender'] >> i*8) & 0xff for i in reversed(range(4))]
         else:
             sender = self.enocean_sender
-        
+
         # Check whether the learn bit should be set in the packet (only valid for RORG.BS1 and RORG.BS4)
         force_learn = False
         if sensor.get('learn'):
@@ -508,8 +498,10 @@ class Communicator:
         # first, look whether we have this sensor configured
         found_sensor = False
         for cur_sensor in self.sensors:
-            if 'address' in cur_sensor and \
-                    enocean.utils.combine_hex(packet.sender) == cur_sensor['address']:
+            # Does this sensor match?
+            if enocean.utils.combine_hex(packet.sender) == cur_sensor.get('address') and \
+               ((packet.rorg == cur_sensor.get('rorg') and not cur_sensor.get('sender')) or \
+                (not cur_sensor.get('rorg') and cur_sensor.get('ignore'))):
                 found_sensor = cur_sensor
                 break
 
@@ -523,7 +515,7 @@ class Communicator:
 
         # abort loop if sensor not found
         if not found_sensor:
-            logging.info("unknown sensor: %s", enocean.utils.to_hex_string(packet.sender))
+            logging.info("unknown sensor: %s (RORG = %s)", enocean.utils.to_hex_string(packet.sender), hex(packet.rorg))
             return
 
         # Handling EnOcean library decision to set learn to True by default.
@@ -537,7 +529,7 @@ class Communicator:
             packet.learn = False
 
         # interpret packet, read properties and publish to MQTT
-        self._read_packet(packet)
+        self._read_packet(packet, found_sensor)
 
         # check for neccessary reply
         if str(found_sensor.get('answer')) in ("True", "true", "1"):
